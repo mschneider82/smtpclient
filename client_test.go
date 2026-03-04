@@ -199,3 +199,158 @@ func TestDialMXInvalid(t *testing.T) {
 		t.Errorf("Expected 'same domain' error, got %v", err)
 	}
 }
+
+// TestDotStuffing verifies that lines starting with "." are properly escaped
+// This is critical for DKIM signatures to remain valid during transmission
+func TestDotStuffing(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	// Channel to capture the received DATA
+	receivedData := make(chan string, 1)
+
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+
+		// Send greeting
+		c.Write([]byte("220 test.example.com ESMTP\r\n"))
+
+		buf := make([]byte, 4096)
+
+		// EHLO
+		n, _ := c.Read(buf)
+		if strings.HasPrefix(string(buf[:n]), "EHLO") {
+			c.Write([]byte("250-test.example.com\r\n250 8BITMIME\r\n"))
+		}
+
+		// MAIL FROM
+		n, _ = c.Read(buf)
+		if strings.HasPrefix(string(buf[:n]), "MAIL FROM") {
+			c.Write([]byte("250 2.1.0 Ok\r\n"))
+		}
+
+		// RCPT TO
+		n, _ = c.Read(buf)
+		if strings.HasPrefix(string(buf[:n]), "RCPT TO") {
+			c.Write([]byte("250 2.1.5 Ok\r\n"))
+		}
+
+		// DATA command
+		n, _ = c.Read(buf)
+		if strings.HasPrefix(string(buf[:n]), "DATA") {
+			c.Write([]byte("354 End data with <CR><LF>.<CR><LF>\r\n"))
+		}
+
+		// Read DATA content until we see the terminating ".\r\n"
+		var dataBuilder strings.Builder
+		for {
+			n, err := c.Read(buf)
+			if err != nil {
+				break
+			}
+			chunk := string(buf[:n])
+			dataBuilder.WriteString(chunk)
+
+			// Check if we received the terminating sequence
+			if strings.HasSuffix(dataBuilder.String(), "\r\n.\r\n") {
+				break
+			}
+		}
+
+		// Send success response
+		c.Write([]byte("250 2.0.0 Ok: queued as ABC123\r\n"))
+
+		// Store received data (without the terminating .\r\n)
+		data := dataBuilder.String()
+		data = strings.TrimSuffix(data, "\r\n.\r\n")
+		receivedData <- data
+
+		// QUIT
+		n, _ = c.Read(buf)
+		if strings.HasPrefix(string(buf[:n]), "QUIT") {
+			c.Write([]byte("221 2.0.0 Bye\r\n"))
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, _, err := Dial(ctx, l.Addr().String(), DefaultOptions())
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+
+	if _, err := client.Hello(ctx, "client.example.com"); err != nil {
+		t.Fatalf("Hello failed: %v", err)
+	}
+
+	if _, err := client.Mail(ctx, "sender@example.com", nil); err != nil {
+		t.Fatalf("Mail failed: %v", err)
+	}
+
+	if _, err := client.Rcpt(ctx, "recipient@example.com", nil); err != nil {
+		t.Fatalf("Rcpt failed: %v", err)
+	}
+
+	w, _, err := client.Data(ctx)
+	if err != nil {
+		t.Fatalf("Data failed: %v", err)
+	}
+
+	// Write a message with lines starting with "."
+	// This simulates the real-world case where URLs like ".com/path" appear
+	testMessage := "Subject: Test dot-stuffing\r\n" +
+		"DKIM-Signature: v=1; a=rsa-sha256; test=value\r\n" +
+		"\r\n" +
+		"This line is normal\r\n" +
+		".com/deutschland - this line starts with a dot\r\n" +
+		"Another normal line\r\n" +
+		".\r\n" + // Single dot on a line (should NOT terminate DATA)
+		"Line after single dot\r\n"
+
+	if _, err := io.WriteString(w, testMessage); err != nil {
+		t.Fatalf("WriteString failed: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if _, err := client.Quit(ctx); err != nil {
+		t.Fatalf("Quit failed: %v", err)
+	}
+
+	// Verify the received data
+	select {
+	case data := <-receivedData:
+		// Check that lines starting with "." are doubled
+		if !strings.Contains(data, "..com/deutschland") {
+			t.Errorf("Expected line starting with '.com' to be dot-stuffed to '..com', but got:\n%s", data)
+		}
+
+		// Check that single "." line is doubled
+		if !strings.Contains(data, "\r\n..\r\n") {
+			t.Errorf("Expected single '.' line to be dot-stuffed to '..', but got:\n%s", data)
+		}
+
+		// Verify the entire message was received including the line after the single dot
+		if !strings.Contains(data, "Line after single dot") {
+			t.Errorf("Message was truncated, expected 'Line after single dot' but got:\n%s", data)
+		}
+
+		// Verify DKIM signature line is intact
+		if !strings.Contains(data, "DKIM-Signature: v=1; a=rsa-sha256; test=value") {
+			t.Errorf("DKIM signature line was corrupted, got:\n%s", data)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for received data")
+	}
+}

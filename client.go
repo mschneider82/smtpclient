@@ -412,7 +412,7 @@ func (c *Client) Mail(ctx context.Context, from string, opts *MailOptions) (Resp
 			cmd += " REQUIRETLS"
 		}
 	}
-	return c.cmd(ctx, 250, cmd)
+	return c.cmd(ctx, 250, "%s", cmd)
 }
 
 // Rcpt sends the RCPT TO command to the server with the provided recipient and options.
@@ -442,7 +442,7 @@ func (c *Client) Rcpt(ctx context.Context, to string, opts *RcptOptions) (Respon
 			cmd += fmt.Sprintf(" MT-PRIORITY=%d", *opts.MTPriority)
 		}
 	}
-	resp, err := c.cmd(ctx, 250, cmd)
+	resp, err := c.cmd(ctx, 250, "%s", cmd)
 	if err == nil {
 		c.rcpts = append(c.rcpts, to)
 	}
@@ -452,8 +452,9 @@ func (c *Client) Rcpt(ctx context.Context, to string, opts *RcptOptions) (Respon
 // DataCommand is a pending DATA command. DataCommand is an io.WriteCloser.
 // See Client.Data.
 type DataCommand struct {
-	client *Client
-	ctx    context.Context
+	client    *Client
+	ctx       context.Context
+	dotWriter io.WriteCloser
 }
 
 // Write implements io.Writer.
@@ -462,7 +463,7 @@ func (cmd *DataCommand) Write(p []byte) (n int, err error) {
 		cmd.client.conn.SetWriteDeadline(deadline)
 		defer cmd.client.conn.SetWriteDeadline(time.Time{})
 	}
-	return cmd.client.text.W.Write(p)
+	return cmd.dotWriter.Write(p)
 }
 
 // Close implements io.Closer.
@@ -488,10 +489,8 @@ func (cmd *DataCommand) CloseWithResponse() (*DataResponse, error) {
 		defer cmd.client.conn.SetWriteDeadline(time.Time{})
 	}
 
-	if _, err := cmd.client.text.W.Write([]byte("\r\n.\r\n")); err != nil {
-		return nil, err
-	}
-	if err := cmd.client.text.W.Flush(); err != nil {
+	// Close the dot writer (sends the terminating .\r\n)
+	if err := cmd.dotWriter.Close(); err != nil {
 		return nil, err
 	}
 
@@ -514,10 +513,8 @@ func (cmd *DataCommand) CloseWithLMTPResponse() (map[string]*DataResponse, error
 		defer cmd.client.conn.SetWriteDeadline(time.Time{})
 	}
 
-	if _, err := cmd.client.text.W.Write([]byte("\r\n.\r\n")); err != nil {
-		return nil, err
-	}
-	if err := cmd.client.text.W.Flush(); err != nil {
+	// Close the dot writer (sends the terminating .\r\n)
+	if err := cmd.dotWriter.Close(); err != nil {
 		return nil, err
 	}
 
@@ -553,7 +550,9 @@ func (c *Client) Data(ctx context.Context) (*DataCommand, Response, error) {
 	if err != nil {
 		return nil, resp, err
 	}
-	return &DataCommand{client: c, ctx: ctx}, resp, nil
+	// Create a dot writer for proper SMTP DATA encoding (dot-stuffing)
+	dotWriter := c.text.DotWriter()
+	return &DataCommand{client: c, ctx: ctx, dotWriter: dotWriter}, resp, nil
 }
 
 // Auth authenticates the client using the provided SASL client.
@@ -568,7 +567,7 @@ func (c *Client) Auth(ctx context.Context, a sasl.Client) (Response, error) {
 		cmd += " " + base64.StdEncoding.EncodeToString(ir)
 	}
 
-	resp, err := c.cmd(ctx, 0, cmd)
+	resp, err := c.cmd(ctx, 0, "%s", cmd)
 	for err == nil && resp.Code == 334 {
 		var challenge []byte
 		challenge, err = base64.StdEncoding.DecodeString(resp.Message)
@@ -582,7 +581,7 @@ func (c *Client) Auth(ctx context.Context, a sasl.Client) (Response, error) {
 			return resp, err
 		}
 
-		resp, err = c.cmd(ctx, 0, base64.StdEncoding.EncodeToString(response))
+		resp, err = c.cmd(ctx, 0, "%s", base64.StdEncoding.EncodeToString(response))
 	}
 
 	if err != nil {
